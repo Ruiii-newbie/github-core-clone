@@ -91,6 +91,9 @@ async function main(): Promise<void> {
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
   await waitForDone();
+  // The trial is over: drop idle keep-alive connections so close() finishes
+  // at once instead of waiting on sockets the env no longer needs.
+  server.closeAllConnections();
   server.close();
   process.stdout.write('[entry] done\n');
 }
