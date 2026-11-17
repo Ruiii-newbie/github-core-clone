@@ -582,7 +582,7 @@ function resolveRoot(ctx: Context, op: Operation, field: FieldNode): unknown {
       ctx.errors.push({ message: 'Could not resolve to an Issue with the id provided.' });
       return null;
     }
-    issue.state = 'closed';
+    store.setIssueState(repo, issue, 'closed');
     issue.updatedAt = FIXED_NOW_ISO;
     return { __type: 'CloseIssuePayload', issue: issueObject(store, repo, issue) };
   }

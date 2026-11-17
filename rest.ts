@@ -18,6 +18,8 @@ export interface RestResponse {
   status: number;
   headers?: Record<string, string>;
   json?: unknown;
+  /** Pre-serialized JSON body: when set, it is sent verbatim instead of stringifying `json`. */
+  text?: string;
 }
 
 let requestCounter = 0;
@@ -25,6 +27,19 @@ let requestCounter = 0;
 export function requestId(): string {
   requestCounter += 1;
   return `req-${requestCounter}`;
+}
+
+/** node_id values are deterministic per (type, number): compute each once. */
+const nodeIdCache = new Map<string, string>();
+
+export function nodeId(prefix: string, n: number): string {
+  const key = `${prefix}:${n}`;
+  let cached = nodeIdCache.get(key);
+  if (cached === undefined) {
+    cached = Buffer.from(`${prefix}:${n}`, 'utf8').toString('base64');
+    nodeIdCache.set(key, cached);
+  }
+  return cached;
 }
 
 function ok(status: number, json: unknown, headers?: Record<string, string>): RestResponse {
@@ -42,7 +57,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function repoView(repo: Repo): Record<string, unknown> {
   return {
     id: repo.id,
-    node_id: Buffer.from(`Repository:${repo.id}`, 'utf8').toString('base64'),
+    node_id: nodeId('Repository', repo.id),
     name: repo.name,
     full_name: `${repo.owner}/${repo.name}`,
     private: repo.isPrivate,
@@ -61,14 +76,14 @@ function repoView(repo: Repo): Record<string, unknown> {
     forks_count: 0,
     stargazers_count: 0,
     watchers_count: 0,
-    open_issues_count: [...repo.issues.values()].filter((i) => i.state === 'open').length,
+    open_issues_count: repo.openIssueCount,
   };
 }
 
 function issueView(issue: Issue): Record<string, unknown> {
   return {
     id: issue.id,
-    node_id: Buffer.from(`Issue:${issue.number}`, 'utf8').toString('base64'),
+    node_id: nodeId('Issue', issue.number),
     number: issue.number,
     title: issue.title,
     body: issue.body,
@@ -81,12 +96,26 @@ function issueView(issue: Issue): Record<string, unknown> {
   };
 }
 
+/** The issue's REST JSON, serialized once and reused until a mutation clears it. */
+export function issueJsonString(issue: Issue): string {
+  let cached = issue.cachedJson;
+  if (cached === null) {
+    cached = JSON.stringify(issueView(issue));
+    issue.cachedJson = cached;
+  }
+  return cached;
+}
+
+function okText(status: number, text: string, headers?: Record<string, string>): RestResponse {
+  return { status, text, headers };
+}
+
 function pullView(store: Store, repo: Repo, pr: PullRequest): Record<string, unknown> {
   const headSha = store.getRef(repo, store.refName(pr.headRef)) ?? pr.headSha;
   const baseSha = store.getRef(repo, store.refName(pr.baseRef)) ?? pr.baseSha;
   return {
     id: pr.id,
-    node_id: Buffer.from(`PullRequest:${pr.number}`, 'utf8').toString('base64'),
+    node_id: nodeId('PullRequest', pr.number),
     number: pr.number,
     title: pr.title,
     body: pr.body,
@@ -133,7 +162,7 @@ export function handleRest(store: Store, req: RestRequest): RestResponse {
       return ok(200, {
         login: VIEWER.login,
         id: VIEWER.id,
-        node_id: Buffer.from(`User:${VIEWER.id}`, 'utf8').toString('base64'),
+        node_id: nodeId('User', VIEWER.id),
         name: VIEWER.name,
         email: VIEWER.email,
         type: 'User',
@@ -380,7 +409,7 @@ export function handleRest(store: Store, req: RestRequest): RestResponse {
             : [];
           const created = store.createIssue(repo, title, typeof body.body === 'string' ? body.body : '', labelNames);
           if ('error' in created) return err(422, created.error);
-          return ok(201, issueView(created));
+          return okText(201, issueJsonString(created));
         }
         if (method === 'GET') {
           const state = req.query.get('state') ?? 'open';
@@ -401,14 +430,20 @@ export function handleRest(store: Store, req: RestRequest): RestResponse {
       const issue = repo.issues.get(num);
       if (!issue) return err(404, 'Not Found');
       if (rest.length === 2) {
-        if (method === 'GET') return ok(200, issueView(issue));
+        if (method === 'GET') return okText(200, issueJsonString(issue));
         if (method === 'PATCH') {
           const body = isRecord(req.body) ? req.body : {};
-          if (typeof body.title === 'string') issue.title = body.title;
-          if (typeof body.body === 'string') issue.body = body.body;
-          if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
+          if (typeof body.title === 'string') {
+            issue.title = body.title;
+            issue.cachedJson = null;
+          }
+          if (typeof body.body === 'string') {
+            issue.body = body.body;
+            issue.cachedJson = null;
+          }
+          if (body.state === 'open' || body.state === 'closed') store.setIssueState(repo, issue, body.state);
           issue.updatedAt = FIXED_NOW_ISO;
-          return ok(200, issueView(issue));
+          return okText(200, issueJsonString(issue));
         }
         return err(404, 'Not Found');
       }

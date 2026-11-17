@@ -49,6 +49,12 @@ export interface Issue {
   seq: number;
   createdAt: string;
   updatedAt: string;
+  /**
+   * The REST view of this issue, serialized once and reused for every read until
+   * a mutation clears it (PATCH, new comment). The read workload GETs the same
+   * issue 2,000 times; rebuilding its JSON on every read is pure waste.
+   */
+  cachedJson: string | null;
 }
 
 export interface PullRequest {
@@ -84,6 +90,8 @@ export interface Repo {
   nextNumber: number;
   seq: number;
   createdAt: string;
+  /** Open issues, maintained incrementally: repoView used to filter every issue per read. */
+  openIssueCount: number;
 }
 
 export interface FileChange {
@@ -103,6 +111,11 @@ export class Store {
   private nextIssueId = 1;
   private nextCommentId = 1;
   private nextSeq = 1;
+  /**
+   * Bumped on every ref write: ref advertisements and ls-refs answers built from a
+   * given ref set stay valid until this counter moves.
+   */
+  refsVersion = 0;
 
   // ------------------------------------------------------------ repos
 
@@ -135,6 +148,7 @@ export class Store {
       nextNumber: 1,
       seq: this.nextSeq++,
       createdAt: FIXED_NOW_ISO,
+      openIssueCount: 0,
     };
     this.repos.set(this.repoKey(owner, name), repo);
     const list = this.ownerRepos.get(owner) ?? [];
@@ -162,10 +176,13 @@ export class Store {
 
   setRef(repo: Repo, ref: string, oid: string): void {
     repo.refs.set(ref, oid);
+    this.refsVersion += 1;
   }
 
   deleteRef(repo: Repo, ref: string): boolean {
-    return repo.refs.delete(ref);
+    const deleted = repo.refs.delete(ref);
+    if (deleted) this.refsVersion += 1;
+    return deleted;
   }
 
   /** All refs of a repo, as [refname, oid] pairs in deterministic order (HEAD first by caller). */
@@ -322,9 +339,19 @@ export class Store {
       seq: this.nextSeq++,
       createdAt: FIXED_NOW_ISO,
       updatedAt: FIXED_NOW_ISO,
+      cachedJson: null,
     };
     repo.issues.set(issue.number, issue);
+    repo.openIssueCount += 1;
     return issue;
+  }
+
+  /** Change an issue's open/closed state, keeping the repo's open count exact. */
+  setIssueState(repo: Repo, issue: Issue, state: 'open' | 'closed'): void {
+    if (issue.state === state) return;
+    issue.state = state;
+    repo.openIssueCount += state === 'open' ? 1 : -1;
+    issue.cachedJson = null;
   }
 
   addComment(repo: Repo, issue: Issue, body: string): IssueComment {
@@ -335,6 +362,8 @@ export class Store {
       createdAt: FIXED_NOW_ISO,
     };
     issue.comments.push(comment);
+    // The REST view carries the comment count: the cached JSON is stale now.
+    issue.cachedJson = null;
     return comment;
   }
 

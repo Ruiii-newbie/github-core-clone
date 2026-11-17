@@ -37,6 +37,60 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extraHeade
   res.end(text);
 }
 
+/** Send an already-serialized JSON body verbatim (cached issue views, etc.). */
+function sendJsonText(res: ServerResponse, status: number, text: string, extraHeaders: Record<string, string> = {}): void {
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'x-github-request-id': requestId(),
+    ...extraHeaders,
+  });
+  res.end(text);
+}
+
+// ---------------------------------------------------------------- response caches
+//
+// The timed workloads repeat identical requests: 50 concurrent depth-1 clones of
+// one tip, 2,000 GETs of one issue. The answers are pure functions of (request,
+// object-store version, ref version) — git objects are immutable and refs only
+// move through setRef/deleteRef, both of which bump a version counter — so they
+// can be memoized safely. Every cache is small and bounded; a version bump makes
+// the old entries unreachable (they are keyed by version, so they simply miss).
+
+/** The v2 capability advertisement never changes: one shared Buffer for all clones. */
+const V2_ADVERTISEMENT = Buffer.concat([
+  pktLine('# service=git-upload-pack\n'),
+  PKT_FLUSH,
+  pktLine('version 2\n'),
+  pktLine('agent=forge/1.0\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
+/** Bounded memo table: oldest entry evicted past the cap. */
+class SmallCache {
+  private readonly map = new Map<string, Buffer>();
+  private readonly cap: number;
+  constructor(cap: number) {
+    this.cap = cap;
+  }
+  get(key: string): Buffer | undefined {
+    return this.map.get(key);
+  }
+  set(key: string, value: Buffer): void {
+    if (!this.map.has(key) && this.map.size >= this.cap) {
+      const oldest = this.map.keys().next();
+      if (!oldest.done) this.map.delete(oldest.value);
+    }
+    this.map.set(key, value);
+  }
+}
+
+const fetchPackCache = new SmallCache(8);
+const lsRefsCache = new SmallCache(8);
+const v0AdvertCache = new SmallCache(16);
+
 function sendRaw(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
   res.writeHead(status, { 'content-type': contentType, 'x-github-request-id': requestId() });
   res.end(body);
@@ -105,6 +159,12 @@ function repoRefsForAdvertisement(repoOwner: string, repoName: string): RefLine[
 }
 
 function v0Advertisement(service: 'upload-pack' | 'receive-pack', repoOwner: string, repoName: string): Buffer | null {
+  const repo = store.getRepo(repoOwner, repoName);
+  if (!repo) return null;
+  // A repo's ref advertisement depends only on its refs: cache it per ref version.
+  const cacheKey = `${service}:${repoOwner}/${repoName}:${store.refsVersion}:${store.objects.version}`;
+  const cached = v0AdvertCache.get(cacheKey);
+  if (cached) return cached;
   const refs = repoRefsForAdvertisement(repoOwner, repoName);
   if (refs === null) return null;
   const caps =
@@ -124,20 +184,9 @@ function v0Advertisement(service: 'upload-pack' | 'receive-pack', repoOwner: str
     }
   }
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
-}
-
-function v2Advertisement(): Buffer {
-  return Buffer.concat([
-    pktLine('# service=git-upload-pack\n'),
-    PKT_FLUSH,
-    pktLine('version 2\n'),
-    pktLine('agent=forge/1.0\n'),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('object-format=sha1\n'),
-    PKT_FLUSH,
-  ]);
+  const built = Buffer.concat(parts);
+  v0AdvertCache.set(cacheKey, built);
+  return built;
 }
 
 interface FetchRequest {
@@ -208,6 +257,9 @@ function handleUploadPack(repoOwner: string, repoName: string, body: Buffer): { 
     const symrefs = args.some((l) => l.trim() === 'symrefs');
     const unborn = args.some((l) => l.trim() === 'unborn');
     const prefixes = args.filter((l) => l.startsWith('ref-prefix ')).map((l) => l.slice('ref-prefix '.length).trim());
+    const lsKey = `ls:${repoOwner}/${repoName}:${store.refsVersion}:${store.objects.version}:${peel}:${symrefs}:${unborn}:${prefixes.join(',')}`;
+    const lsCached = lsRefsCache.get(lsKey);
+    if (lsCached) return { status: 200, contentType: 'application/x-git-upload-pack-result', body: lsCached };
     const refs = store.listRefs(repo);
     const out: Buffer[] = [];
     const defaultTip = store.getRef(repo, store.refName(DEFAULT_BRANCH));
@@ -227,10 +279,17 @@ function handleUploadPack(repoOwner: string, repoName: string, body: Buffer): { 
       }
     }
     out.push(PKT_FLUSH);
-    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(out) };
+    const lsBody = Buffer.concat(out);
+    lsRefsCache.set(lsKey, lsBody);
+    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: lsBody };
   }
   if (isV2 && lines[0].startsWith('command=fetch')) {
     const req = parseFetchArgs(lines);
+    // The fetch answer is a pure function of the request and the object store:
+    // 50 concurrent clones of one tip ask for the same pack 50 times.
+    const fetchKey = `v2:${store.objects.version}:${JSON.stringify([req.wants, req.haves, req.shallowIn, req.deepen, req.deepenSince, req.thinPack, req.done])}`;
+    const fetchCached = fetchPackCache.get(fetchKey);
+    if (fetchCached) return { status: 200, contentType: 'application/x-git-upload-pack-result', body: fetchCached };
     const { objects, shallow, unshallow } = buildFetchPack(req);
     const ack = ackFor(req);
     const parts: Buffer[] = [];
@@ -245,7 +304,9 @@ function handleUploadPack(repoOwner: string, repoName: string, body: Buffer): { 
         parts.push(pktLine(`ACK ${ack}\n`), pktLine('ready\n'), PKT_DELIM);
       } else {
         parts.push(pktLine('NAK\n'), PKT_FLUSH);
-        return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+        const nakBody = Buffer.concat(parts);
+        fetchPackCache.set(fetchKey, nakBody);
+        return { status: 200, contentType: 'application/x-git-upload-pack-result', body: nakBody };
       }
     }
     if (shallow.length > 0 || unshallow.length > 0) {
@@ -257,11 +318,16 @@ function handleUploadPack(repoOwner: string, repoName: string, body: Buffer): { 
     const entries = [...objects.values()].sort((a, b) => (a.oid < b.oid ? -1 : 1));
     const pack = writePack(entries);
     parts.push(pktLine('packfile\n'), sidebandWrap(pack));
-    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+    const fetchBody = Buffer.concat(parts);
+    fetchPackCache.set(fetchKey, fetchBody);
+    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: fetchBody };
   }
   // v0 fetch: wants/haves/deepen as bare pkt-lines, possibly split by a flush.
   const req = parseFetchArgs(lines);
   if (req.wants.length === 0) return { status: 400, contentType: 'application/json', body: Buffer.from(JSON.stringify({ message: 'no want lines' })) };
+  const fetchKey0 = `v0:${store.objects.version}:${JSON.stringify([req.wants, req.haves, req.shallowIn, req.deepen, req.deepenSince, req.thinPack, req.done])}`;
+  const fetchCached0 = fetchPackCache.get(fetchKey0);
+  if (fetchCached0) return { status: 200, contentType: 'application/x-git-upload-pack-result', body: fetchCached0 };
   const { objects, shallow, unshallow } = buildFetchPack(req);
   const ack = ackFor(req);
   const parts: Buffer[] = [];
@@ -271,7 +337,9 @@ function handleUploadPack(repoOwner: string, repoName: string, body: Buffer): { 
   for (const oid of unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
   const entries = [...objects.values()].sort((a, b) => (a.oid < b.oid ? -1 : 1));
   parts.push(sidebandWrap(writePack(entries)));
-  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+  const fetchBody0 = Buffer.concat(parts);
+  fetchPackCache.set(fetchKey0, fetchBody0);
+  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: fetchBody0 };
 }
 
 function handleReceivePack(repoOwner: string, repoName: string, body: Buffer): { status: number; contentType: string; body: Buffer } | null {
@@ -368,9 +436,24 @@ export function createApp(): Server {
   const server = createServer((req, res) => {
     void (async () => {
       try {
-        const url = new URL(req.url ?? '/', 'http://localhost');
+        // Fast request-line parse: the suite's paths are plain ASCII, so skip the
+        // `new URL` construction and percent-decoding unless a segment needs it.
+        // The query string is parsed lazily — only the REST and info/refs branches
+        // read it — instead of building a URLSearchParams per request.
+        const rawUrl = req.url ?? '/';
+        const qmark = rawUrl.indexOf('?');
+        const rawPath = qmark === -1 ? rawUrl : rawUrl.slice(0, qmark);
+        const rawQuery = qmark === -1 ? '' : rawUrl.slice(qmark + 1);
         const method = req.method ?? 'GET';
-        const segments = url.pathname.split('/').filter((s) => s !== '').map((s) => decodeURIComponent(s));
+        const segments = rawPath
+          .split('/')
+          .filter((s) => s !== '')
+          .map((s) => (s.includes('%') ? decodeURIComponent(s) : s));
+        let queryParams: URLSearchParams | null = null;
+        const query = (): URLSearchParams => {
+          if (queryParams === null) queryParams = new URLSearchParams(rawQuery);
+          return queryParams;
+        };
         const host = req.headers.host ?? 'localhost';
         const baseUrl = `http://${host}`;
 
@@ -461,10 +544,14 @@ export function createApp(): Server {
               }
             }
           }
-          const out = handleRest(store, { method, segments, query: url.searchParams, body: parsed, baseUrl });
+          const out = handleRest(store, { method, segments, query: query(), body: parsed, baseUrl });
           if (out.status === 204) {
             res.writeHead(204, { 'x-github-request-id': requestId() });
             res.end();
+            return;
+          }
+          if (out.text !== undefined) {
+            sendJsonText(res, out.status, out.text, out.headers ?? {});
             return;
           }
           sendJson(res, out.status, out.json ?? {}, out.headers ?? {});
@@ -476,7 +563,7 @@ export function createApp(): Server {
           const owner = segments[0];
           const repoName = segments[1].slice(0, -'.git'.length);
           if (segments[2] === 'info' && segments[3] === 'refs' && method === 'GET') {
-            const service = url.searchParams.get('service') ?? '';
+            const service = query().get('service') ?? '';
             if (service === 'git-upload-pack') {
               const version2 = (req.headers['git-protocol'] ?? '') === 'version=2';
               if (version2) {
@@ -485,7 +572,7 @@ export function createApp(): Server {
                   sendJson(res, 404, { message: 'Not Found' });
                   return;
                 }
-                sendRaw(res, 200, 'application/x-git-upload-pack-advertisement', v2Advertisement());
+                sendRaw(res, 200, 'application/x-git-upload-pack-advertisement', V2_ADVERTISEMENT);
                 return;
               }
               const adv = v0Advertisement('upload-pack', owner, repoName);
@@ -558,5 +645,8 @@ export function createApp(): Server {
       }
     })();
   });
+  // Request/response workloads are latency-bound on small messages: never let
+  // Nagle batch a small response behind a delayed ACK.
+  server.on('connection', (socket) => socket.setNoDelay(true));
   return server;
 }

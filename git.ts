@@ -19,13 +19,21 @@ export function sha1Hex(data: Buffer): string {
 }
 
 export function hashObject(type: ObjType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1Hex(Buffer.concat([header, data]));
+  // Stream the header and payload into the hash: no Buffer.concat copy of the payload.
+  const hash = createHash('sha1');
+  hash.update(`${type} ${data.length}\0`, 'utf8');
+  hash.update(data);
+  return hash.digest('hex');
 }
 
 /** One in-memory object store, shared by every repo (objects are content-addressed). */
 export class ObjectStore {
   private readonly map = new Map<string, GitObject>();
+  /**
+   * Bumped on every object put: git objects are immutable, so a fetch-pack answer
+   * built from a given object set stays valid until this counter moves.
+   */
+  version = 0;
 
   has(oid: string): boolean {
     return this.map.has(oid);
@@ -37,12 +45,18 @@ export class ObjectStore {
 
   put(type: ObjType, data: Buffer): string {
     const oid = hashObject(type, data);
-    if (!this.map.has(oid)) this.map.set(oid, { type, data });
+    if (!this.map.has(oid)) {
+      this.map.set(oid, { type, data });
+      this.version += 1;
+    }
     return oid;
   }
 
   putRaw(oid: string, type: ObjType, data: Buffer): void {
-    if (!this.map.has(oid)) this.map.set(oid, { type, data });
+    if (!this.map.has(oid)) {
+      this.map.set(oid, { type, data });
+      this.version += 1;
+    }
   }
 
   get size(): number {
@@ -90,13 +104,25 @@ export function decodePktLines(buf: Buffer): { lines: string[]; rest: Buffer; ga
 const PACK_TYPES: Record<number, ObjType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 const PACK_TYPE_IDS: Record<ObjType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
 
+/** Deflate level for pack objects: 1 is the fastest level that still compresses
+ *  (level 0 stores uncompressed and is slower and larger here; level 6 costs ~15%
+ *  more CPU for ~1% smaller output on 1 KiB objects). The pack format is unchanged. */
+const PACK_DEFLATE_LEVEL = 1;
+
 export function writePack(entries: { oid: string; type: ObjType; data: Buffer }[]): Buffer {
   const parts: Buffer[] = [];
+  // The trailer is the SHA-1 of every preceding byte: feed the hash incrementally
+  // instead of Buffer.concat-ing the whole pack twice (once to hash, once to return).
+  const trailerHash = createHash('sha1');
+  const push = (buf: Buffer): void => {
+    parts.push(buf);
+    trailerHash.update(buf);
+  };
   const header = Buffer.alloc(12);
   header.write('PACK', 0, 'ascii');
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(entries.length, 8);
-  parts.push(header);
+  push(header);
   for (const entry of entries) {
     // object header: type + size, varint (little-endian 7-bit groups).
     let size = entry.data.length;
@@ -110,11 +136,11 @@ export function writePack(entries: { oid: string; type: ObjType; data: Buffer }[
       size >>= 7;
     }
     headBytes.push(byte);
-    const deflated = deflateSync(entry.data, { level: 6 });
-    parts.push(Buffer.from(headBytes), deflated);
+    const deflated = deflateSync(entry.data, { level: PACK_DEFLATE_LEVEL });
+    push(Buffer.from(headBytes));
+    push(deflated);
   }
-  const trailer = createHash('sha1').update(Buffer.concat(parts)).digest();
-  parts.push(trailer);
+  parts.push(trailerHash.digest());
   return Buffer.concat(parts);
 }
 

@@ -14,9 +14,43 @@
 //   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
 //      reads.
 //
-// main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
+// main.ts imports its own server plus node:http for the env client: no package,
+// no model call.
+
+import { request as httpRequest, Agent as HttpAgent, type IncomingMessage } from 'node:http';
 
 import { createApp } from './app.ts';
+
+/**
+ * The env is polled for the whole trial (register once, /done every few hundred
+ * milliseconds), so one keep-alive agent serves every env request over a single
+ * reused TCP connection instead of a fresh connection per poll.
+ */
+const ENV_AGENT = new HttpAgent({ keepAlive: true, maxSockets: 1 });
+
+/** One env request over the shared agent: resolves with its status and body text. */
+function envRequest(path: string, method: string, body?: string): Promise<{ status: number; text: string }> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      `${ENV_URL}${path}`,
+      {
+        method,
+        agent: ENV_AGENT,
+        headers: body !== undefined ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } : {},
+      },
+      (res: IncomingMessage) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString('utf8') }));
+        res.on('error', reject);
+      },
+    );
+    req.setTimeout(REQUEST_TIMEOUT_MS, () => req.destroy(new Error('env request timed out')));
+    req.on('error', reject);
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+}
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
@@ -45,14 +79,9 @@ function retryDelay(attempt: number): number {
 async function register(port: number): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      const res = await fetch(`${ENV_URL}/register`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ port }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
+      const res = await envRequest('/register', 'POST', JSON.stringify({ port }));
       if (res.status === 200 || res.status === 409) return;
-      if (res.status === 400 || res.status === 405) throw new Error(`register answered HTTP ${res.status}: ${await res.text()}`);
+      if (res.status === 400 || res.status === 405) throw new Error(`register answered HTTP ${res.status}: ${res.text}`);
     } catch (err) {
       if (err instanceof Error && err.message.startsWith('register answered HTTP ')) throw err;
     }
@@ -64,9 +93,9 @@ async function register(port: number): Promise<void> {
 async function waitForDone(): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      const res = await fetch(`${ENV_URL}/done`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-      if (res.ok) {
-        const body = (await res.json()) as { done?: unknown };
+      const res = await envRequest('/done', 'GET');
+      if (res.status === 200) {
+        const body = JSON.parse(res.text) as { done?: unknown };
         if (body.done === true) return;
       }
     } catch {
@@ -91,10 +120,14 @@ async function main(): Promise<void> {
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
   await waitForDone();
-  // The trial is over: drop idle keep-alive connections so close() finishes
-  // at once instead of waiting on sockets the env no longer needs.
-  server.closeAllConnections();
-  server.close();
+  // The trial is over: drop only the idle keep-alive connections, so close()
+  // is not held open by sockets the env no longer needs, then drain any
+  // response still in flight before exiting (process.exit would cut it off).
+  server.closeIdleConnections();
+  await Promise.race([
+    new Promise<void>((resolve) => server.close(() => resolve())),
+    sleep(1000),
+  ]);
   process.stdout.write('[entry] done\n');
 }
 
